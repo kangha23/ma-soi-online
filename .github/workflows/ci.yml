@@ -367,7 +367,38 @@ jobs:
         # lệnh gửi kèm và luôn chạy deploy/deploy.sh. Script đó tự git pull,
         # build, up -d, rồi chờ /api/health xanh trong 180 giây - không xanh thì
         # nó in 100 dòng log cuối và thoát khác 0, kéo theo job này đỏ.
-        run: ssh -o BatchMode=yes -o ConnectTimeout=20 "${{ secrets.VPS_HOST }}" deploy
+        #
+        # SSH timeout (exit 255, "Connection timed out") nghĩa là runner không
+        # mở được TCP tới VPS - KHÔNG phải lỗi build. Nguyên nhân thường gặp:
+        # VPS down, firewall nhà cung cấp chặn IP runner, hoặc fail2ban trên
+        # VPS đã ban IP runner. Kiểm tra trên VPS (ssh masoi còn vào được):
+        #   sudo fail2ban-client status sshd; sudo ufw status verbose
+        #   sudo systemctl status ssh; sudo journalctl -u ssh --since "2 hours ago" | tail -30
+        # Vòng lặp dưới chỉ chống blip mạng nhất thời (thử lại 3 lần), không
+        # sửa được chặn firewall - lúc đó log TCP precheck sẽ chỉ rõ.
+        run: |
+          set -uo pipefail
+          host="${{ secrets.VPS_HOST }}"
+          plain="${host#*@}"
+          echo "Kiểm tra TCP 22 tới $plain ..."
+          if ! timeout 15 bash -c "cat < /dev/null > /dev/tcp/$plain/22"; then
+            echo "LỖI: không mở được TCP tới $plain:22 trong 15s."
+            echo "VPS vẫn có thể sống (thử curl https://masoionline.duckdns.org/api/health từ máy bạn)."
+            echo "Nếu health còn xanh mà runner không tới được: firewall/fail2ban đang chặn dải IP GitHub Actions."
+            echo "Vào VPS bằng 'ssh masoi' rồi chạy:"
+            echo '  sudo fail2ban-client status sshd; sudo ufw status verbose; sudo systemctl status ssh'
+            exit 1
+          fi
+          echo "TCP 22 thông, bắt đầu SSH deploy (tối đa 3 lần thử) ..."
+          for i in 1 2 3; do
+            if ssh -o BatchMode=yes -o ConnectTimeout=20 -o ConnectionAttempts=2 "$host" deploy; then
+              exit 0
+            fi
+            echo "Thử lần $i thất bại (exit $?), chờ 15s rồi thử lại ..."
+            sleep 15
+          done
+          echo "LỖI: SSH deploy thất bại sau 3 lần thử. Xem gợi ý fail2ban/ufw ở trên." >&2
+          exit 1
 
       - name: Kiểm tra từ ngoài Internet
         # deploy.sh đã kiểm health qua 127.0.0.1 ở trong máy. Bước này kiểm từ
@@ -403,11 +434,21 @@ jobs:
           # Socket.IO phải lên WebSocket thật. Thiếu hai header Upgrade trong
           # Nginx thì client vẫn chạy được bằng long-polling - chậm hơn nhiều mà
           # không có lỗi nào, nên phải kiểm riêng chứ không suy ra từ 200 ở trên.
-          ws=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
-            -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
-            -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
-            "$url/socket.io/?EIO=4&transport=websocket" || true)
-          test "$ws" = "101" || { echo "WebSocket trả $ws, đáng lẽ 101"; exit 1; }
+          #
+          # Thử lại như hai vòng trên, không kiểm một phát: đã đỏ thật một lần
+          # với 400 ngay sau khi container server vừa bị thay (health và trang
+          # chủ đều đã xanh). `--http1.1` để bắt đúng ngữ nghĩa upgrade của
+          # RFC 6455, tránh việc thương lượng HTTP/2 làm sai lệch mã trả về.
+          ws=""
+          for i in $(seq 1 12); do
+            ws=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 --http1.1 \
+              -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+              -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+              "$url/socket.io/?EIO=4&transport=websocket" 2>/dev/null || true)
+            test "$ws" = "101" && break
+            sleep 10
+          done
+          test "$ws" = "101" || { echo "WebSocket trả $ws sau 120s, đáng lẽ 101"; exit 1; }
 
           version=$(echo "$health" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
           echo "Đã deploy: $version" >> "$GITHUB_STEP_SUMMARY"
